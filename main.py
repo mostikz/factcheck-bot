@@ -24,17 +24,17 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-AITUNNEL_API_KEY = os.getenv("AITUNNEL_API_KEY")
+TOKENN_API_KEY = os.getenv("TOKENN_API_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN в .env")
 
-if not AITUNNEL_API_KEY:
-    raise RuntimeError("Не найден AITUNNEL_API_KEY в .env")
+if not TOKENN_API_KEY:
+    raise RuntimeError("Не найден TOKENN_API_KEY в .env")
 
 
-MODEL = "gemini-3.8-flash"
-AITUNNEL_BASE_URL = "https://api.aitunnel.ru/v1"
+MODEL = "gpt-6.1-sol"
+TOKENN_BASE_URL = "https://api.tokenn.pro/v1"
 
 MAX_HISTORY = 8
 MAX_MESSAGE_LENGTH = 2000
@@ -66,12 +66,12 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# AITUNNEL
+# TOKENN API
 # ============================================================
 
 client = OpenAI(
-    api_key=AITUNNEL_API_KEY,
-    base_url=AITUNNEL_BASE_URL,
+    api_key=TOKENN_API_KEY,
+    base_url=TOKENN_BASE_URL,
 )
 
 
@@ -526,20 +526,12 @@ RESPONSE_SCHEMA = {
 }
 
 
-# ============================================================
-# WEB SEARCH
-# ============================================================
+# Responses API uses the schema directly inside text.format.
+RESPONSE_JSON_SCHEMA = RESPONSE_SCHEMA["json_schema"]["schema"]
 
-WEB_SEARCH_TOOL = {
-    "type": "aitunnel:web_search",
-    "parameters": {
-        "engine": "auto",
-        "max_results": MAX_SEARCH_RESULTS,
-        "max_total_results": MAX_TOTAL_SEARCH_RESULTS,
-        "max_uses": MAX_WEB_SEARCHES,
-        "search_context_size": "medium",
-    },
-}
+# OpenAI-compatible Responses API web search. If TokenN does not expose
+# Responses API/tool support for this key, the code falls back to Chat Completions.
+RESPONSES_WEB_SEARCH_TOOL = {"type": "web_search"}
 
 
 # ============================================================
@@ -724,9 +716,7 @@ def ask_ai(
     reply_number: int,
 ) -> dict[str, Any] | None:
 
-    history = thread_histories[
-        thread_key
-    ]
+    history = thread_histories[thread_key]
 
     messages = [
         {
@@ -740,18 +730,14 @@ def ask_ai(
         messages.append(item)
 
     if is_continuation:
-
         current_message = (
             f"Пользователь @{username} "
             f"ОТВЕЧАЕТ НА ТВОЁ ПРЕДЫДУЩЕЕ СООБЩЕНИЕ.\n\n"
             f"Его сообщение:\n"
             f"{user_text}\n\n"
-            f"Это продолжение номер "
-            f"{reply_number}."
+            f"Это продолжение номер {reply_number}."
         )
-
     else:
-
         current_message = (
             f"Новый самостоятельный пользователь "
             f"@{username} написал:\n\n"
@@ -768,107 +754,96 @@ def ask_ai(
     )
 
     logger.info(
-        "Отправляю запрос в AITUNNEL. "
-        "Model=%s | continuation=%s | "
-        "reply=%s/%s",
+        "Отправляю запрос в TokenN. Model=%s | continuation=%s | reply=%s/%s",
         MODEL,
         is_continuation,
         reply_number,
         MAX_REPLIES_PER_THREAD,
     )
 
+    response = None
+    content = None
+    finish_reason = None
+    used_responses_api = False
+
+    # Сначала пробуем Responses API со встроенным веб-поиском.
+    # GPT-6.1 Sol поддерживает веб-поиск через Responses API, если шлюз TokenN
+    # предоставляет этот endpoint и инструмент для данного API-ключа.
     try:
-
-        response = client.chat.completions.create(
+        response = client.responses.create(
             model=MODEL,
-
-            messages=messages,
-
-            tools=[
-                WEB_SEARCH_TOOL
-            ],
-
-            tool_choice="auto",
-
-            response_format=RESPONSE_SCHEMA,
-
-            max_tokens=MAX_OUTPUT_TOKENS,
-
-            temperature=0.85,
-
-            extra_body={
-                "reasoning": {
-                    "effort": "low",
-                    "exclude": True,
+            input=messages,
+            tools=[RESPONSES_WEB_SEARCH_TOOL],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "factcheck_response",
+                    "strict": True,
+                    "schema": RESPONSE_JSON_SCHEMA,
                 }
             },
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            reasoning={"effort": "low"},
+        )
+        used_responses_api = True
+        content = getattr(response, "output_text", None)
+
+        status = getattr(response, "status", None)
+        if status == "incomplete":
+            finish_reason = "length"
+
+        logger.info(
+            "TokenN Responses API: status=%s | web_search_requested=true",
+            status,
         )
 
     except Exception as exc:
-
-        logger.exception(
-            "Ошибка запроса к AITUNNEL: %s",
+        logger.warning(
+            "Responses API или web search недоступны; пробую Chat Completions "
+            "без встроенного поиска. Ошибка: %s",
             exc,
         )
 
-        return None
+        # Резервный путь: совместимый Chat Completions endpoint.
+        # Он сохраняет ответы бота, но если шлюз не поддерживает Responses API,
+        # в этом резервном запросе встроенный веб-поиск не выполняется.
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                response_format=RESPONSE_SCHEMA,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                temperature=0.85,
+            )
+            choice = response.choices[0]
+            finish_reason = getattr(choice, "finish_reason", None)
+            content = getattr(choice.message, "content", None)
 
-    # ========================================================
-    # META
-    # ========================================================
+            logger.info(
+                "TokenN Chat Completions fallback: finish_reason=%s",
+                finish_reason,
+            )
 
-    try:
-
-        choice = response.choices[0]
-
-        finish_reason = getattr(
-            choice,
-            "finish_reason",
-            None,
-        )
-
-        native_finish_reason = getattr(
-            choice,
-            "native_finish_reason",
-            None,
-        )
-
-        logger.info(
-            "finish_reason=%s | "
-            "native_finish_reason=%s",
-            finish_reason,
-            native_finish_reason,
-        )
-
-    except Exception:
-
-        finish_reason = None
+        except Exception as fallback_exc:
+            logger.exception(
+                "Ошибка запроса к TokenN Chat Completions: %s",
+                fallback_exc,
+            )
+            return None
 
     # ========================================================
     # USAGE
     # ========================================================
-
     try:
-
-        usage = getattr(
-            response,
-            "usage",
-            None,
-        )
-
+        usage = getattr(response, "usage", None)
         if usage:
-
             try:
                 usage_dict = usage.model_dump()
-
             except Exception:
-
                 try:
                     usage_dict = usage.dict()
-
                 except Exception:
                     usage_dict = {}
-
             logger.info(
                 "Usage: %s",
                 json.dumps(
@@ -877,93 +852,58 @@ def ask_ai(
                     default=str,
                 ),
             )
-
     except Exception as exc:
-
-        logger.warning(
-            "Не удалось прочитать usage: %s",
-            exc,
-        )
+        logger.warning("Не удалось прочитать usage: %s", exc)
 
     # ========================================================
     # CONTENT
     # ========================================================
-
-    try:
-
-        content = (
-            response
-            .choices[0]
-            .message
-            .content
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Не удалось получить content: %s",
-            exc,
-        )
-
-        return None
+    if not content and used_responses_api:
+        # На случай шлюза, который не предоставляет response.output_text
+        # как удобное свойство SDK.
+        try:
+            pieces = []
+            for item in getattr(response, "output", []) or []:
+                if getattr(item, "type", None) != "message":
+                    continue
+                for part in getattr(item, "content", []) or []:
+                    if getattr(part, "type", None) == "output_text":
+                        text_value = getattr(part, "text", None)
+                        if text_value:
+                            pieces.append(text_value)
+            content = "\n".join(pieces).strip()
+        except Exception as exc:
+            logger.warning("Не удалось извлечь текст Responses API: %s", exc)
 
     if not content:
-
-        logger.warning(
-            "AITUNNEL вернул пустой ответ."
-        )
-
+        logger.warning("TokenN вернул пустой ответ.")
         return None
 
-    logger.info(
-        "Ответ AITUNNEL: %s",
-        content,
-    )
+    logger.info("Ответ TokenN: %s", content)
 
     # ========================================================
     # JSON
     # ========================================================
-
-    data = safe_json_loads(
-        content
-    )
+    data = safe_json_loads(content)
 
     if data is None:
-
-        logger.error(
-            "Не удалось разобрать JSON."
-        )
-
-        logger.error(
-            "Raw content: %r",
-            content,
-        )
+        logger.error("Не удалось разобрать JSON.")
+        logger.error("Raw content: %r", content)
 
         if finish_reason == "length":
-
-            logger.error(
-                "Ответ обрезан по лимиту токенов."
-            )
+            logger.error("Ответ обрезан по лимиту токенов.")
 
         return None
 
-    result = validate_result(
-        data
-    )
+    result = validate_result(data)
 
     if result is None:
-
-        logger.error(
-            "Неверная структура JSON: %r",
-            data,
-        )
-
+        logger.error("Неверная структура JSON: %r", data)
         return None
 
     # ========================================================
     # HISTORY
     # ========================================================
-
     history.append(
         {
             "role": "user",
@@ -972,7 +912,6 @@ def ask_ai(
     )
 
     if result["should_reply"]:
-
         history.append(
             {
                 "role": "assistant",
@@ -1254,7 +1193,7 @@ def main() -> None:
         MODEL,
     )
     logger.info(
-        "Web search: AITUNNEL"
+        "API: TokenN | Responses API web search with Chat Completions fallback"
     )
     logger.info(
         "Max web searches: %s",
