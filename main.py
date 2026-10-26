@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import time
 from collections import defaultdict, deque
 from typing import Any
@@ -10,135 +9,486 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-AI_API_KEY = (
-    os.getenv("AITUNNEL_API_KEY")
-    or os.getenv("AI_API_KEY")
-    or ""
-).strip()
-AI_BASE_URL = os.getenv(
-    "AI_BASE_URL", "https://api.aitunnel.ru/v1"
-).strip()
-AI_MODEL = os.getenv("AI_MODEL", "gemini-3.8-flash").strip()
-
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
-MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "2500"))
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "900"))
-MAX_WEB_SEARCHES = int(os.getenv("MAX_WEB_SEARCHES", "2"))
-MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
-MAX_REPLIES_PER_THREAD = int(os.getenv("MAX_REPLIES_PER_THREAD", "5"))
-THREAD_TIMEOUT_SECONDS = int(os.getenv("THREAD_TIMEOUT_SECONDS", "900"))
-MIN_SECONDS_BETWEEN_UNSOLICITED_REPLIES = float(
-    os.getenv("MIN_SECONDS_BETWEEN_UNSOLICITED_REPLIES", "8")
-)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TOKENN_API_KEY = os.getenv("TOKENN_API_KEY")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN в .env")
+    raise RuntimeError("Не найден BOT_TOKEN в .env")
 
-if not AI_API_KEY:
-    raise RuntimeError("Не задан AITUNNEL_API_KEY или AI_API_KEY в .env")
+if not TOKENN_API_KEY:
+    raise RuntimeError("Не найден TOKENN_API_KEY в .env")
+
+
+MODEL = os.getenv("MODEL", "gpt-6.1-sol").strip() or "gpt-6.1-sol"
+TOKENN_BASE_URL = "https://api.tokenn.pro/v1"
+
+MAX_HISTORY = 8
+MAX_MESSAGE_LENGTH = 2000
+
+MAX_WEB_SEARCHES = 2
+MAX_SEARCH_RESULTS = 5
+MAX_TOTAL_SEARCH_RESULTS = 10
+
+MAX_OUTPUT_TOKENS = 700
+
+MAX_REPLIES_PER_THREAD = 3
+THREAD_TIMEOUT_SECONDS = 10 * 60
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("sarcastic_bot")
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# TOKENN API
+# ============================================================
 
 client = OpenAI(
-    api_key=AI_API_KEY,
-    base_url=AI_BASE_URL,
+    api_key=TOKENN_API_KEY,
+    base_url=TOKENN_BASE_URL,
 )
 
-SYSTEM_PROMPT = r"""
-Ты — живой участник русскоязычного Telegram-чата:
-умный, язвительный, вредный, остроумный, уверенный и иногда неприятный.
-У тебя острый язык, но ты не тупой хам и не генератор одинаковых оскорблений.
 
-ТВОЯ ЗАДАЧА:
-Поддерживать естественный разговор, отвечать на вопросы, участвовать
-в переписке, а когда кто-то уверенно сообщает неверный проверяемый факт —
-исправлять его фактами и при случае метко подкалывать.
+# ============================================================
+# HISTORY
+# ============================================================
 
-СТИЛЬ:
-- Разговорный русский, естественный ритм, уместный сленг и иногда мат.
-- Можно язвить, иронизировать, поддевать самоуверенность и нелепую логику.
-- Не будь вежливым ради вежливости и не поддакивай автоматически.
-- Не используй шаблонные фразы и одну и ту же шутку из раза в раз.
-- Без воды: каждое предложение должно что-то добавлять.
-- Простая реплика — короткий ответ; сложный вопрос — нормальное объяснение
-  с фактами, примерами и аргументами.
-- Не начинай каждый ответ с «Конечно», «Хороший вопрос», «Давай разберёмся».
-- Не заканчивай «Надеюсь, это помогло».
-- Не злоупотребляй эмодзи, списками и формальными выводами.
-- Не утверждай, что ты человек, и не выдумывай личный опыт.
+thread_histories: dict[
+    tuple[int, int],
+    deque,
+] = defaultdict(
+    lambda: deque(maxlen=MAX_HISTORY)
+)
 
-КОГДА ОТВЕЧАТЬ:
-Реши, нужно ли вмешиваться в конкретное сообщение.
-Верни should_reply=false, если сообщение не требует твоего участия.
+thread_reply_counts: dict[
+    tuple[int, int],
+    int,
+] = defaultdict(int)
 
-1. Если тебя спросили напрямую, упомянули по @username или ответили
-   на твоё сообщение — отвечай.
-2. Если в чате задан содержательный вопрос, на который ты можешь ответить,
-   можешь включиться, даже если тебя не отметили. Не отвечай на каждую
-   риторическую фразу, вопрос к конкретному человеку или очевидный мем.
-3. Если человек уверенно сообщает проверяемый фактический тезис, который
-   существенно неверен, можешь вмешаться и исправить его.
-   Делай это только при реальной ошибке, а не из-за мнения или шутки.
-4. Не вмешивайся в обычную болтовню, личные предпочтения, приветствия
-   и разговоры, где твоё участие лишнее.
-5. Если факты неясны или утверждение зависит от контекста, не объявляй его
-   ложным только ради подколки. При необходимости используй веб-поиск.
-6. Не повторяй исправление, если его уже объяснили и новых аргументов нет.
-7. В группе несколько параллельных разговоров. Не связывай новое сообщение
-   с чужой старой перепалкой, если это не reply на сообщение бота.
+thread_last_activity: dict[
+    tuple[int, int],
+    float,
+] = defaultdict(float)
 
-ФАКТЧЕК:
-- Различай факт, мнение, шутку, предположение и преувеличение.
-- Если человек прав — не выдумывай контраргументы. Можешь признать правоту
-  с иронией, но без натужной попытки унизить.
-- Если тезис частично верен, укажи, какая часть верна и что не так.
-- Для актуальных, спорных или малоизвестных фактов используй веб-поиск,
-  если инструмент доступен.
-- Никогда не выдумывай статистику, исследования, цитаты, источники или цифры.
-- Сначала дай точный ответ или аргумент, затем добавь подколку, если уместно.
-- Высмеивай тезис, логику и самоуверенность, а не защищённые характеристики
-  человека. Не используй угрозы и не пожелай реального вреда.
 
-КОНТЕКСТ:
-- История передаётся только для конкретной ветки ответа на сообщение бота.
-- Если сообщение новое и самостоятельное, оценивай его само по себе.
-- Если это продолжение reply-ветки, отвечай с учётом истории именно этой ветки.
-- Если собеседник сменил тему, отвечай на новую тему.
-- Не продолжай бесконечную перепалку: после нескольких ответов ветка остановится.
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
 
-ФОРМАТ:
-Верни только JSON:
-{"should_reply": true, "verdict": "false", "answer": "текст"}
+SYSTEM_PROMPT = """
+Ты — крайне язвительный, высокомерный, ехидный и неприятно
+уверенный в себе участник Telegram-чата.
+
+Твоя специализация — ловить людей на фактической чуши.
+
+Ты не должен звучать как:
+- Википедия;
+- школьный учитель;
+- пресс-секретарь;
+- вежливый консультант;
+- корпоративный бот.
+
+Ты должен звучать как человек, которому уже надоело,
+что люди уверенно говорят ерунду, и который с удовольствием
+тычет их носом в собственную ошибку.
+
+============================================================
+ХАРАКТЕР
+============================================================
+
+Будь максимально:
+
+- язвительным;
+- саркастичным;
+- ехидным;
+- наглым;
+- высокомерным;
+- колким;
+- раздражающим;
+- насмешливым;
+- дерзким.
+
+Если человек сказал очевидную глупость —
+не жалей его чувства и не превращай ответ в лекцию.
+
+Ты не обязан говорить:
+
+«К сожалению, это утверждение неверно.»
+
+Говори:
+
+«Нет. Просто нет. Ты это сейчас откуда высрал?»
+
+Или:
+
+«Нет, конечно. Уверенности у тебя вагон,
+а фактов туда почему-то не завезли.»
+
+Или:
+
+«Ты это так уверенно написал, будто лично проверял.
+Жаль, что реальность забыла согласовать с тобой детали.»
+
+Или:
+
+«Какая самоуверенная херня. Москва вообще-то в России.»
+
+Или:
+
+«Нет. 2+2=4. Поздравляю, ты только что проиграл
+начальной школе.»
+
+============================================================
+ВАЖНО: МАТ НЕ РАДИ МАТА
+============================================================
+
+Мат разрешён как часть естественной язвительной речи,
+но не превращай каждую реплику в бессмысленный поток мата.
+
+Плохой вариант:
+
+«Блядь, нет, нахуй, пиздец.»
+
+Хороший вариант:
+
+«Нет, блядь. Москва в России. Ты глобус сегодня
+вообще открывал или решил импровизировать?»
+
+Мат должен усиливать подколку.
+
+============================================================
+КАК РАЗЪЁБЫВАТЬ ОШИБКУ
+============================================================
+
+Хороший ответ обычно состоит из:
+
+1. Жёсткого укола.
+2. Правильного факта.
+3. Короткого добивания.
+
+Пример:
+
+Пользователь:
+«Москва находится в США»
+
+Ответ:
+
+«Нет, блядь, Москва в России. Ты географию по
+комментариям в интернете изучал?»
+
+Другой:
+
+«Нет. Москва — Россия. Уверенности у тебя,
+конечно, как будто ты лично границы рисовал.»
+
+Другой:
+
+«Какая уверенная хуйня. Москва находится в России.
+Можешь убрать США обратно с карты мира.»
+
+============================================================
+НЕ БУДЬ ОДНООБРАЗНЫМ
+============================================================
+
+Не используй одну и ту же шутку постоянно.
+
+Каждый ответ должен ощущаться немного иначе.
+
+Можно высмеивать:
+
+- самоуверенность;
+- нелепость;
+- отсутствие элементарных знаний;
+- странную логику;
+- противоречие;
+- попытку спорить с очевидным;
+- слишком серьёзный тон человека;
+- нелепое объяснение.
+
+Примеры:
+
+«Удивительная уверенность человека, который только что
+проиграл карте мира.»
+
+«Смело. Очень смело. Особенно учитывая, что это неправда.»
+
+«Ты сейчас споришь не со мной, а с реальностью.
+И пока проигрываешь со счётом 0:1.»
+
+«Мне нравится твоя вера в себя. Жаль, что факты
+её совершенно не разделяют.»
+
+«Ты можешь сколько угодно это повторять.
+Правдой оно от этого не станет.»
+
+«Это даже не спорный факт. Это просто неправильно.»
+
+«Блядь, ну ты хотя бы иногда проверяй то,
+что пишешь с такой уверенностью.»
+
+============================================================
+ОТВЕТЫ НА ВОПРОСЫ
+============================================================
+
+Если человек задаёт конкретный вопрос —
+ОТВЕЧАЙ НА НЕГО.
+
+Не уходи в предыдущую перепалку.
+
+Если человек спрашивает:
+
+«Почему вода кипит при 100 градусах?»
+
+Ответь именно про температуру кипения.
+
+Если человек спрашивает:
+
+«Кто написал "Войну и мир"?»
+
+Ответь именно на этот вопрос.
+
+Если человек спрашивает:
+
+«А почему?»
+
+И это действительно продолжение конкретного сообщения —
+ответь на предыдущий факт.
+
+Но если другой человек в чате задаёт новый вопрос,
+он важнее старой перепалки.
+
+============================================================
+САМОЕ ВАЖНОЕ ПРАВИЛО КОНТЕКСТА
+============================================================
+
+НЕ ПРЕДПОЛАГАЙ, что каждое сообщение в группе является
+продолжением предыдущего разговора.
+
+В Telegram-группе одновременно могут разговаривать
+десять человек.
+
+Поэтому:
+
+ЕСЛИ СООБЩЕНИЕ НЕ ЯВЛЯЕТСЯ REPLY НА СООБЩЕНИЕ БОТА:
+
+считай его НОВЫМ самостоятельным сообщением.
+
+Даже если оно начинается с:
+
+«А почему»
+«А как»
+«А что»
+«И что»
+«Ну а»
+
+оно НЕ обязательно продолжает старый спор.
+
+Сначала анализируй именно это сообщение.
+
+============================================================
+REPLY НА БОТА
+============================================================
+
+Если пользователь нажал «Ответить» на конкретное сообщение
+бота — тогда это продолжение именно этой ветки.
+
+В таком случае можно использовать предыдущие сообщения
+этой ветки.
+
+Но даже здесь:
+
+- максимум несколько реплик;
+- не спорь бесконечно;
+- отвечай конкретно;
+- не уходи в сторону.
+
+============================================================
+ЛИМИТ СПОРА
+============================================================
+
+На одну ветку reply максимум 3 ответа бота.
+
+После третьего:
+
+не продолжай спор.
+
+Но это ограничение относится ТОЛЬКО к этой ветке.
+
+Другие люди в чате должны продолжать получать ответы.
+
+Новое самостоятельное сообщение всегда рассматривается заново.
+
+============================================================
+ЕСЛИ ЧЕЛОВЕК ПРАВ
+============================================================
+
+Не спорь ради спора.
+
+Можно ответить с издёвкой:
+
+«Ладно, тут ты прав. Можешь сохранить этот исторический
+момент — такое у тебя бывает нечасто.»
+
+Или:
+
+«Да, тут ты попал в реальность. Даже случайно,
+но всё-таки попал.»
+
+Или:
+
+«Неожиданно, но да. Сегодня ты сказал что-то правильное.»
+
+============================================================
+МНЕНИЯ
+============================================================
+
+Если человек пишет:
+
+«Мне нравится пицца с ананасом»
+
+это мнение.
+
+Не надо устраивать фактчек.
+
+should_reply=false.
+
+============================================================
+ШУТКИ
+============================================================
+
+Если очевидно, что человек шутит или пишет мем —
+не душни.
+
+============================================================
+АКТУАЛЬНЫЕ ФАКТЫ
+============================================================
+
+Для актуальных, спорных или малоизвестных утверждений
+используй web search.
+
+Поиск нужен только тебе.
+
+Пользователь НЕ должен видеть:
+- источники;
+- ссылки;
+- список сайтов;
+- результаты поиска.
+
+============================================================
+КОРОТКО
+============================================================
+
+Обычно:
+
+1–2 предложения.
+
+Максимум 3, если действительно требуется объяснение.
+
+Не пиши статьи.
+
+Не читай лекции.
+
+Не добавляй источники.
+
+Не заканчивай ответ:
+
+«Надеюсь, это помогло.»
+
+Ты не саппорт.
+
+============================================================
+ГРАНИЦЫ
+============================================================
+
+Высмеивай именно:
+
+- ошибку;
+- аргумент;
+- самоуверенность;
+- нелепость;
+- отсутствие знаний.
+
+Не используй угрозы или пожелания вреда.
+
+Не оскорбляй людей по признакам расы, национальности,
+религии, пола, сексуальной ориентации, инвалидности
+или другим защищённым характеристикам.
+
+============================================================
+JSON
+============================================================
+
+Ответ строго:
+
+{
+  "should_reply": true,
+  "verdict": "false",
+  "answer": "текст"
+}
+
+Только эти поля.
 
 Допустимые verdict:
-"false", "true", "partly_true", "uncertain", "opinion", "casual".
 
-Если отвечать не нужно:
-{"should_reply": false, "verdict": "casual", "answer": ""}
+"false"
+"true"
+"partly_true"
+"uncertain"
+"opinion"
+"casual"
 
-Если отвечать нужно, answer должен содержать обычный текст.
-Не оборачивай JSON в Markdown.
+Если отвечать не надо:
+
+{
+  "should_reply": false,
+  "verdict": "casual",
+  "answer": ""
+}
+
+Никакого markdown.
+Никаких ```json.
+Никаких дополнительных полей.
 """
+
+
+# ============================================================
+# RESPONSE SCHEMA
+# ============================================================
 
 RESPONSE_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
-        "name": "chat_decision",
+        "name": "factcheck_response",
         "strict": True,
         "schema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "should_reply": {"type": "boolean"},
+                "should_reply": {
+                    "type": "boolean"
+                },
                 "verdict": {
                     "type": "string",
                     "enum": [
@@ -147,112 +497,54 @@ RESPONSE_SCHEMA = {
                         "partly_true",
                         "uncertain",
                         "opinion",
-                        "casual",
-                    ],
+                        "casual"
+                    ]
                 },
-                "answer": {"type": "string"},
+                "answer": {
+                    "type": "string"
+                }
             },
-            "required": ["should_reply", "verdict", "answer"],
-        },
-    },
+            "required": [
+                "should_reply",
+                "verdict",
+                "answer"
+            ]
+        }
+    }
 }
 
-ENABLE_WEB_SEARCH = (
-    os.getenv("ENABLE_WEB_SEARCH", "1").lower()
-    not in {"0", "false", "no"}
-)
+RESPONSE_JSON_SCHEMA = RESPONSE_SCHEMA["json_schema"]["schema"]
 
-WEB_SEARCH_TOOL = {
-    "type": "aitunnel:web_search",
-    "parameters": {
-        "engine": "auto",
-        "max_results": MAX_SEARCH_RESULTS,
-        "max_total_results": MAX_SEARCH_RESULTS * 2,
-        "max_uses": MAX_WEB_SEARCHES,
-        "search_context_size": "medium",
-    },
-}
-
-histories: dict[tuple[int, int], deque] = defaultdict(
-    lambda: deque(maxlen=MAX_HISTORY)
-)
-reply_counts: dict[tuple[int, int], int] = defaultdict(int)
-last_activity: dict[tuple[int, int], float] = defaultdict(float)
-last_unsolicited_reply: dict[int, float] = defaultdict(float)
-
-bot_username: str | None = None
+RESPONSES_WEB_SEARCH_TOOL = {"type": "web_search"}
 
 
-def clean_text(value: str) -> str:
-    value = value.strip()
+# ============================================================
+# HELPERS
+# ============================================================
 
-    if len(value) > MAX_MESSAGE_LENGTH:
-        value = value[:MAX_MESSAGE_LENGTH] + "…"
+def clean_text(text: str) -> str:
+    text = text.strip()
 
-    return value
+    if len(text) > MAX_MESSAGE_LENGTH:
+        text = text[:MAX_MESSAGE_LENGTH] + "…"
 
-
-def is_reply_to_bot(message: Any) -> bool:
-    reply = getattr(message, "reply_to_message", None)
-
-    return bool(
-        reply
-        and reply.from_user
-        and reply.from_user.is_bot
-    )
+    return text
 
 
-def get_thread_key(
-    chat_id: int,
-    message: Any,
-) -> tuple[int, int]:
-    if is_reply_to_bot(message):
-        return chat_id, message.reply_to_message.message_id
+def safe_json_loads(
+    text: str,
+) -> dict[str, Any] | None:
 
-    return chat_id, message.message_id
-
-
-def thread_expired(key: tuple[int, int]) -> bool:
-    last = last_activity.get(key, 0)
-
-    return bool(
-        last and time.time() - last > THREAD_TIMEOUT_SECONDS
-    )
-
-
-def is_directly_addressed(message: Any, text: str) -> bool:
-    if is_reply_to_bot(message):
-        return True
-
-    if bot_username and re.search(
-        rf"(?i)(?<!\w)@{re.escape(bot_username)}\b",
-        text,
-    ):
-        return True
-
-    for entity in (getattr(message, "entities", None) or []):
-        if getattr(entity, "type", None) == "mention":
-            start = entity.offset
-            end = start + entity.length
-            mention = text[start:end].lower()
-
-            if bot_username and mention == f"@{bot_username.lower()}":
-                return True
-
-    return False
-
-
-def safe_json_loads(text: str) -> dict[str, Any] | None:
     if not text:
         return None
 
     text = text.strip()
 
     try:
-        value = json.loads(text)
+        data = json.loads(text)
 
-        if isinstance(value, dict):
-            return value
+        if isinstance(data, dict):
+            return data
 
     except json.JSONDecodeError:
         pass
@@ -260,12 +552,15 @@ def safe_json_loads(text: str) -> dict[str, Any] | None:
     start = text.find("{")
     end = text.rfind("}")
 
-    if start >= 0 and end > start:
-        try:
-            value = json.loads(text[start:end + 1])
+    if start != -1 and end != -1 and end > start:
 
-            if isinstance(value, dict):
-                return value
+        candidate = text[start:end + 1]
+
+        try:
+            data = json.loads(candidate)
+
+            if isinstance(data, dict):
+                return data
 
         except json.JSONDecodeError:
             pass
@@ -274,8 +569,9 @@ def safe_json_loads(text: str) -> dict[str, Any] | None:
 
 
 def validate_result(
-    data: dict[str, Any] | None,
+    data: dict[str, Any],
 ) -> dict[str, Any] | None:
+
     if not isinstance(data, dict):
         return None
 
@@ -311,254 +607,507 @@ def validate_result(
     }
 
 
+def get_thread_key(
+    chat_id: int,
+    message: Any,
+) -> tuple[int, int]:
+
+    if (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.is_bot
+    ):
+        return (
+            chat_id,
+            message.reply_to_message.message_id,
+        )
+
+    return (
+        chat_id,
+        message.message_id,
+    )
+
+
+def is_reply_to_bot(
+    message: Any,
+) -> bool:
+
+    if not message:
+        return False
+
+    reply = message.reply_to_message
+
+    if not reply:
+        return False
+
+    if not reply.from_user:
+        return False
+
+    return bool(reply.from_user.is_bot)
+
+
+def thread_expired(
+    key: tuple[int, int],
+) -> bool:
+
+    last_activity = thread_last_activity.get(key, 0)
+
+    if not last_activity:
+        return False
+
+    return (
+        time.time() - last_activity
+        > THREAD_TIMEOUT_SECONDS
+    )
+
+
+# ============================================================
+# AI
+# ============================================================
+
 def ask_ai(
     thread_key: tuple[int, int],
     username: str,
     user_text: str,
-    direct: bool,
-    continuation: bool,
+    is_continuation: bool,
     reply_number: int,
 ) -> dict[str, Any] | None:
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT}
+
+    history = thread_histories[thread_key]
+
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        }
     ]
 
-    if continuation:
-        messages.extend(list(histories[thread_key]))
+    for item in history:
+        messages.append(item)
 
-    current = (
-        f"Сообщение от @{username}.\n"
-        f"Прямое обращение к боту: {'ДА' if direct else 'НЕТ'}.\n"
-        f"Продолжение reply-ветки: {'ДА' if continuation else 'НЕТ'}.\n"
-        f"Номер ответа в этой ветке: {reply_number}.\n\n"
-        f"Текст сообщения:\n{user_text}\n\n"
-        "Реши, нужно ли вмешаться по правилам системного промпта. "
-        "Если это просто болтовня или мнение без вопроса и без "
-        "фактической ошибки — молчи."
+    if is_continuation:
+        current_message = (
+            f"Пользователь @{username} "
+            f"ОТВЕЧАЕТ НА ТВОЁ ПРЕДЫДУЩЕЕ СООБЩЕНИЕ.\n\n"
+            f"Его сообщение:\n"
+            f"{user_text}\n\n"
+            f"Это продолжение номер {reply_number}."
+        )
+    else:
+        current_message = (
+            f"Новый самостоятельный пользователь "
+            f"@{username} написал:\n\n"
+            f"{user_text}\n\n"
+            f"Не связывай это сообщение с другими "
+            f"разговорами в группе."
+        )
+
+    messages.append(
+        {
+            "role": "user",
+            "content": current_message,
+        }
     )
 
-    messages.append({"role": "user", "content": current})
+    logger.info(
+        "Отправляю запрос в TokenN. Model=%s | continuation=%s | reply=%s/%s",
+        MODEL,
+        is_continuation,
+        reply_number,
+        MAX_REPLIES_PER_THREAD,
+    )
 
-    kwargs: dict[str, Any] = {
-        "model": AI_MODEL,
-        "messages": messages,
-        "response_format": RESPONSE_SCHEMA,
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "temperature": 0.8,
-    }
+    response = None
+    content = None
+    finish_reason = None
+    used_responses_api = False
 
-    if ENABLE_WEB_SEARCH:
-        kwargs["tools"] = [WEB_SEARCH_TOOL]
-        kwargs["tool_choice"] = "auto"
+    # Сначала пробуем Responses API со встроенным веб-поиском.
+    try:
+        response = client.responses.create(
+            model=MODEL,
+            input=messages,
+            tools=[RESPONSES_WEB_SEARCH_TOOL],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "factcheck_response",
+                    "strict": True,
+                    "schema": RESPONSE_JSON_SCHEMA,
+                }
+            },
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            reasoning={"effort": "low"},
+        )
 
-    kwargs["extra_body"] = {
-        "reasoning": {
-            "effort": "low",
-            "exclude": True,
-        }
-    }
+        used_responses_api = True
+        content = getattr(response, "output_text", None)
+
+        status = getattr(response, "status", None)
+
+        if status == "incomplete":
+            finish_reason = "length"
+
+        logger.info(
+            "TokenN Responses API: status=%s | web_search_requested=true",
+            status,
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "Responses API или web search недоступны; "
+            "пробую Chat Completions без встроенного поиска. "
+            "Ошибка: %s",
+            exc,
+        )
+
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                response_format=RESPONSE_SCHEMA,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                temperature=0.85,
+            )
+
+            choice = response.choices[0]
+            finish_reason = getattr(choice, "finish_reason", None)
+            content = getattr(choice.message, "content", None)
+
+            logger.info(
+                "TokenN Chat Completions fallback: finish_reason=%s",
+                finish_reason,
+            )
+
+        except Exception as fallback_exc:
+            logger.exception(
+                "Ошибка запроса к TokenN Chat Completions: %s",
+                fallback_exc,
+            )
+            return None
+
+    # ========================================================
+    # USAGE
+    # ========================================================
 
     try:
-        response = client.chat.completions.create(**kwargs)
-        choice = response.choices[0]
-        content = choice.message.content or ""
-
         usage = getattr(response, "usage", None)
 
         if usage:
+            try:
+                usage_dict = usage.model_dump()
+            except Exception:
+                try:
+                    usage_dict = usage.dict()
+                except Exception:
+                    usage_dict = {}
+
             logger.info(
-                "Token usage: %s",
-                usage.model_dump_json()
-                if hasattr(usage, "model_dump_json")
-                else usage,
+                "Usage: %s",
+                json.dumps(
+                    usage_dict,
+                    ensure_ascii=False,
+                    default=str,
+                ),
             )
 
-        if not content:
-            logger.warning("Провайдер вернул пустой ответ")
-            return None
-
-        result = validate_result(safe_json_loads(content))
-
-        if result is None:
-            logger.error(
-                "Не удалось разобрать ответ модели: %r",
-                content[:1000],
-            )
-            return None
-
-        histories[thread_key].append(
-            {"role": "user", "content": current}
+    except Exception as exc:
+        logger.warning(
+            "Не удалось прочитать usage: %s",
+            exc,
         )
 
-        if result["should_reply"]:
-            histories[thread_key].append(
-                {"role": "assistant", "content": result["answer"]}
+    # ========================================================
+    # CONTENT
+    # ========================================================
+
+    if not content and used_responses_api:
+        try:
+            pieces = []
+
+            for item in getattr(response, "output", []) or []:
+                if getattr(item, "type", None) != "message":
+                    continue
+
+                for part in getattr(item, "content", []) or []:
+                    if getattr(part, "type", None) == "output_text":
+                        text_value = getattr(part, "text", None)
+
+                        if text_value:
+                            pieces.append(text_value)
+
+            content = "\n".join(pieces).strip()
+
+        except Exception as exc:
+            logger.warning(
+                "Не удалось извлечь текст Responses API: %s",
+                exc,
             )
 
-        return result
-
-    except Exception:
-        logger.exception("Ошибка AI API")
+    if not content:
+        logger.warning("TokenN вернул пустой ответ.")
         return None
 
+    logger.info("Ответ TokenN: %s", content)
+
+    # ========================================================
+    # JSON
+    # ========================================================
+
+    data = safe_json_loads(content)
+
+    if data is None:
+        logger.error("Не удалось разобрать JSON.")
+        logger.error("Raw content: %r", content)
+
+        if finish_reason == "length":
+            logger.error("Ответ обрезан по лимиту токенов.")
+
+        return None
+
+    result = validate_result(data)
+
+    if result is None:
+        logger.error("Неверная структура JSON: %r", data)
+        return None
+
+    # ========================================================
+    # HISTORY
+    # ========================================================
+
+    history.append(
+        {
+            "role": "user",
+            "content": current_message,
+        }
+    )
+
+    if result["should_reply"]:
+        history.append(
+            {
+                "role": "assistant",
+                "content": result["answer"],
+            }
+        )
+
+    return result
+
+
+# ============================================================
+# TELEGRAM HANDLER
+# ============================================================
 
 async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
 
-    if (
-        not message
-        or not message.text
-        or not chat
-        or not user
-        or user.is_bot
-    ):
+    message = update.effective_message
+
+    if not message:
+        return
+
+    if not message.text:
         return
 
     text = clean_text(message.text)
 
-    if not text or text.startswith("/"):
+    if not text:
         return
 
-    username = user.username or user.first_name or "unknown"
-    continuation = is_reply_to_bot(message)
-    direct = is_directly_addressed(message, text)
-    thread_key = get_thread_key(chat.id, message)
+    chat = update.effective_chat
 
-    if continuation:
-        if thread_expired(thread_key):
-            histories[thread_key].clear()
-            reply_counts[thread_key] = 0
+    if not chat:
+        return
 
-        if reply_counts[thread_key] >= MAX_REPLIES_PER_THREAD:
-            logger.info("Лимит reply-ветки достигнут: %s", thread_key)
-            return
+    user = update.effective_user
 
-    else:
-        histories[thread_key].clear()
-        reply_counts[thread_key] = 0
+    if not user:
+        return
 
-    reply_number = reply_counts[thread_key] + 1
+    username = (
+        user.username
+        or user.first_name
+        or "unknown"
+    )
 
     logger.info(
-        "Chat=%s user=%s direct=%s continuation=%s text=%r",
+        "[%s] @%s: %s",
         chat.id,
         username,
-        direct,
-        continuation,
-        text[:300],
+        text,
     )
+
+    if text.startswith("/"):
+        return
+
+    # ========================================================
+    # THREAD
+    # ========================================================
+
+    continuation = is_reply_to_bot(message)
+    thread_key = get_thread_key(chat.id, message)
+
+    if not continuation:
+        thread_reply_counts[thread_key] = 0
+        thread_histories[thread_key].clear()
+        thread_last_activity[thread_key] = time.time()
+
+        logger.info(
+            "НОВАЯ НЕЗАВИСИМАЯ ТЕМА | thread=%s",
+            thread_key,
+        )
+
+    else:
+        if thread_expired(thread_key):
+            logger.info("Ветка устарела. Создаю новую.")
+
+            thread_reply_counts[thread_key] = 0
+            thread_histories[thread_key].clear()
+
+        logger.info(
+            "ПРОДОЛЖЕНИЕ REPLY-ВЕТКИ | thread=%s | count=%s/%s",
+            thread_key,
+            thread_reply_counts[thread_key],
+            MAX_REPLIES_PER_THREAD,
+        )
+
+    # ========================================================
+    # LIMIT ONLY FOR THIS THREAD
+    # ========================================================
+
+    if (
+        continuation
+        and thread_reply_counts[thread_key] >= MAX_REPLIES_PER_THREAD
+    ):
+        logger.info(
+            "Лимит этой конкретной reply-ветки достигнут: "
+            "%s/%s | thread=%s",
+            thread_reply_counts[thread_key],
+            MAX_REPLIES_PER_THREAD,
+            thread_key,
+        )
+        return
+
+    reply_number = thread_reply_counts[thread_key] + 1
+
+    # ========================================================
+    # AI
+    # ========================================================
 
     result = await asyncio.to_thread(
         ask_ai,
         thread_key,
         username,
         text,
-        direct,
         continuation,
         reply_number,
     )
 
     if not result:
+        logger.warning("Не удалось получить ответ AI.")
         return
 
-    if not result["should_reply"] or not result["answer"]:
+    should_reply = result["should_reply"]
+    verdict = result["verdict"]
+    answer = result["answer"]
+
+    logger.info(
+        "AI result: should_reply=%s | verdict=%s | thread=%s",
+        should_reply,
+        verdict,
+        thread_key,
+    )
+
+    if not should_reply or not answer:
         return
 
-    # Ограничиваем незапрошенные вмешательства, но не ответы на обращения.
-    if not direct and not continuation:
-        now = time.time()
+    # ========================================================
+    # COUNT ONLY REAL BOT ANSWER
+    # ========================================================
 
-        if (
-            now - last_unsolicited_reply[chat.id]
-            < MIN_SECONDS_BETWEEN_UNSOLICITED_REPLIES
-        ):
-            logger.info(
-                "Пропуск ответа из-за cooldown в чате %s",
-                chat.id,
-            )
-            return
+    thread_reply_counts[thread_key] += 1
+    thread_last_activity[thread_key] = time.time()
 
-        last_unsolicited_reply[chat.id] = now
+    # ========================================================
+    # SEND
+    # ========================================================
 
     try:
         sent = await message.reply_text(
-            result["answer"],
+            answer,
             disable_web_page_preview=True,
-            reply_to_message_id=message.message_id,
-            allow_sending_without_reply=True,
         )
-
-        reply_counts[thread_key] += 1
-        last_activity[thread_key] = time.time()
 
         logger.info(
-            "Ответ отправлен | chat=%s thread=%s count=%s/%s "
-            "msg=%s verdict=%s",
-            chat.id,
+            "Бот ответил | thread=%s | reply=%s/%s | bot_message_id=%s",
             thread_key,
-            reply_counts[thread_key],
+            thread_reply_counts[thread_key],
             MAX_REPLIES_PER_THREAD,
             sent.message_id,
-            result["verdict"],
         )
 
-    except Exception:
-        logger.exception("Не удалось отправить ответ в Telegram")
+    except Exception as exc:
+        logger.exception(
+            "Ошибка отправки сообщения: %s",
+            exc,
+        )
 
+
+# ============================================================
+# ERROR
+# ============================================================
 
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    logger.error(
+
+    logger.exception(
         "Ошибка Telegram: %s",
         context.error,
-        exc_info=context.error,
     )
 
 
-async def post_init(application: Application) -> None:
-    global bot_username
-
-    me = await application.bot.get_me()
-    bot_username = me.username
-
-    logger.info("Бот авторизован: @%s", bot_username)
-
+# ============================================================
+# MAIN
+# ============================================================
 
 def main() -> None:
+
+    logger.info("=" * 40)
+    logger.info("FactCheck Bot")
+    logger.info("Model: %s", MODEL)
     logger.info(
-        "Запуск: model=%s base_url=%s web_search=%s max_replies=%s",
-        AI_MODEL,
-        AI_BASE_URL,
-        ENABLE_WEB_SEARCH,
+        "API: TokenN | Responses API web search with Chat Completions fallback"
+    )
+    logger.info("Max web searches: %s", MAX_WEB_SEARCHES)
+    logger.info("Max output tokens: %s", MAX_OUTPUT_TOKENS)
+    logger.info(
+        "Max replies per reply-thread: %s",
         MAX_REPLIES_PER_THREAD,
     )
+    logger.info("Thread timeout: %s sec", THREAD_TIMEOUT_SECONDS)
+    logger.info("=" * 40)
 
-    app = (
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
         .build()
     )
 
-    app.add_handler(
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             handle_message,
         )
     )
 
-    app.add_error_handler(error_handler)
+    application.add_error_handler(error_handler)
 
-    logger.info("Бот запущен и ожидает сообщения")
+    logger.info("Бот запущен. Ожидаю сообщения...")
 
-    app.run_polling(
+    application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
 
