@@ -33,7 +33,7 @@ if not TOKENN_API_KEY:
     raise RuntimeError("Не найден TOKENN_API_KEY в .env")
 
 
-MODEL = "gpt-6.1-sol"
+MODEL = os.getenv("MODEL", "gpt-6.1-sol")
 TOKENN_BASE_URL = "https://api.tokenn.pro/v1"
 
 MAX_HISTORY = 8
