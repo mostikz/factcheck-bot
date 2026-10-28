@@ -35,7 +35,6 @@ if not GPTUNNEL_API_KEY:
 
 
 # Модель берётся из переменной MODEL на bothost.
-# Если переменная не задана, используется значение по умолчанию.
 MODEL = os.getenv("MODEL", "gemini-2.5-flash").strip()
 GPTUNNEL_BASE_URL = "https://gptunnel.ru/v1"
 
@@ -59,6 +58,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+
+# Не писать в лог URL с токеном бота от httpx и телеграм-библиотеки.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -471,6 +474,7 @@ JSON
 Никакого markdown.
 Никаких ```json.
 Никаких дополнительных полей.
+Внутри строк не используй переносы строк, пиши ответ в одну строку.
 """
 
 
@@ -488,13 +492,18 @@ def clean_text(text: str) -> str:
 
 
 def safe_json_loads(text: str) -> dict[str, Any] | None:
+    """
+    strict=False разрешает переносы строк и другие управляющие
+    символы внутри строковых значений JSON.
+    Модели иногда вставляют их в поле answer.
+    """
     if not text:
         return None
 
     text = text.strip()
 
     try:
-        data = json.loads(text)
+        data = json.loads(text, strict=False)
 
         if isinstance(data, dict):
             return data
@@ -509,7 +518,7 @@ def safe_json_loads(text: str) -> dict[str, Any] | None:
         candidate = text[start:end + 1]
 
         try:
-            data = json.loads(candidate)
+            data = json.loads(candidate, strict=False)
 
             if isinstance(data, dict):
                 return data
@@ -544,7 +553,9 @@ def validate_result(data: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(answer, str):
         return None
 
-    answer = answer.strip()
+    # Убираем переносы строк, чтобы сообщение в Telegram
+    # не выглядело разорванным.
+    answer = " ".join(answer.split())
 
     if should_reply and not answer:
         return None
