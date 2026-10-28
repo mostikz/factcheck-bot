@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import logging
@@ -17,28 +16,15 @@ from telegram.ext import (
     filters,
 )
 
+
 # ============================================================
-# CONFIG — ТОЛЬКО GPTUNNEL, БЕЗ TOKENN И AITUNNEL
+# CONFIG
 # ============================================================
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-GPTUNNEL_API_KEY = os.getenv("GPTUNNEL_API_KEY", "").strip()
-GPTUNNEL_BASE_URL = os.getenv(
-    "GPTUNNEL_BASE_URL", "https://gptunnel.ru/v1"
-).strip().rstrip("/")
-MODEL = os.getenv("MODEL", "gpt-6.1-sol").strip() or "gpt-6.1-sol"
-
-TARGET_USERNAME = os.getenv(
-    "TARGET_USERNAME", "gonzo_alive"
-).strip().lstrip("@").lower()
-
-MAX_HISTORY = 8
-MAX_MESSAGE_LENGTH = 2000
-MAX_OUTPUT_TOKENS = 1000
-MAX_REPLIES_PER_THREAD = 3
-THREAD_TIMEOUT_SECONDS = 10 * 60
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GPTUNNEL_API_KEY = os.getenv("GPTUNNEL_API_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN в переменных окружения")
@@ -46,116 +32,486 @@ if not BOT_TOKEN:
 if not GPTUNNEL_API_KEY:
     raise RuntimeError("Не найден GPTUNNEL_API_KEY в переменных окружения")
 
+
+# Точное название модели берите из личного кабинета GPTunnel.
+MODEL = "gemini-2.5-flash"
+GPTUNNEL_BASE_URL = "https://gptunnel.ru/v1"
+
+MAX_HISTORY = 8
+MAX_MESSAGE_LENGTH = 2000
+
+MAX_OUTPUT_TOKENS = 700
+
+# Максимум реплик внутри одной ветки reply на сообщение бота.
+MAX_REPLIES_PER_THREAD = 3
+
+# Через сколько секунд ветка считается забытой.
+THREAD_TIMEOUT_SECONDS = 10 * 60
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+
 logger = logging.getLogger(__name__)
 
-# GPTunnel: адрес и авторизация настраиваются здесь.
+
+# ============================================================
+# GPTUNNEL CLIENT
+# ============================================================
+
 client = OpenAI(
     api_key=GPTUNNEL_API_KEY,
     base_url=GPTUNNEL_BASE_URL,
-    default_headers={"Authorization": GPTUNNEL_API_KEY},
-    timeout=60.0,
-    max_retries=1,
 )
 
-# История и лимиты ведутся отдельно для каждой ветки.
-thread_histories: dict[tuple[int, int], deque] = defaultdict(
+
+# ============================================================
+# HISTORY
+#
+# История привязана к THREAD.
+# Обычные сообщения НЕ продолжают старую ветку.
+# ============================================================
+
+thread_histories: dict[
+    tuple[int, int],
+    deque,
+] = defaultdict(
     lambda: deque(maxlen=MAX_HISTORY)
 )
-thread_reply_counts: dict[tuple[int, int], int] = defaultdict(int)
-thread_last_activity: dict[tuple[int, int], float] = defaultdict(float)
+
+# Сколько раз бот уже ответил в конкретной ветке.
+thread_reply_counts: dict[
+    tuple[int, int],
+    int,
+] = defaultdict(int)
+
+# Время последней активности ветки.
+thread_last_activity: dict[
+    tuple[int, int],
+    float,
+] = defaultdict(float)
+
 
 # ============================================================
 # SYSTEM PROMPT
 # ============================================================
 
 SYSTEM_PROMPT = """
-Ты — язвительный, саркастичный участник Telegram-чата.
-Твоя специализация — замечать фактическую чушь и уверенно
-исправлять её с подколкой. Пиши как живой человек, не как
-Википедия, школьный учитель или корпоративный консультант.
+Ты — крайне язвительный, высокомерный, ехидный и неприятно
+уверенный в себе участник Telegram-чата.
 
-СТИЛЬ:
-- Сарказм, ирония, ехидство и подколки разрешены.
-- Мат допустим, когда естественно усиливает шутку.
-- Не повторяй одни и те же формулировки.
-- Высмеивай ошибку, аргумент и самоуверенность, а не
-  защищённые характеристики человека.
-- Никаких угроз и пожеланий вреда.
+Твоя специализация — ловить людей на фактической чуши.
 
-КОГДА ОТВЕЧАТЬ:
-1. Если сообщение содержит вопрос — ответь на вопрос.
-2. Если есть явная фактическая ошибка — поправь её.
-3. Если утверждение верное — не выдумывай опровержение.
-   При необходимости можешь коротко признать правоту с иронией.
-4. Мнения, вкусы, обычные реплики и очевидные шутки не нужно
-   фактчекать. На них обычно should_reply=false.
-5. Не спорь ради спора и не выдумывай факты.
-6. Для сомнительных или актуальных утверждений, если не уверен,
-   лучше verdict="uncertain", чем уверенная выдумка.
-7. Отвечай кратко: обычно 1–2 предложения, максимум 3.
-8. Не добавляй ссылки, источники, Markdown или вступления.
-9. Учитывай предыдущие сообщения только в переданном контексте.
-   Не выдумывай отсутствующие детали.
-10. Если пользователь просто продолжает перепалку, отвечай по сути,
-    но не раздувай бесконечный спор.
+Ты не должен звучать как:
+- Википедия;
+- школьный учитель;
+- пресс-секретарь;
+- вежливый консультант;
+- корпоративный бот.
 
-Верни СТРОГО JSON с тремя полями:
+Ты должен звучать как человек, которому уже надоело,
+что люди уверенно говорят ерунду, и который с удовольствием
+тычет их носом в собственную ошибку.
+
+============================================================
+ХАРАКТЕР
+============================================================
+
+Будь максимально:
+
+- язвительным;
+- саркастичным;
+- ехидным;
+- наглым;
+- высокомерным;
+- колким;
+- раздражающим;
+- насмешливым;
+- дерзким.
+
+Если человек сказал очевидную глупость —
+не жалей его чувства и не превращай ответ в лекцию.
+
+Ты не обязан говорить:
+
+«К сожалению, это утверждение неверно.»
+
+Говори:
+
+«Нет. Просто нет. Ты это сейчас откуда высрал?»
+
+Или:
+
+«Нет, конечно. Уверенности у тебя вагон,
+а фактов туда почему-то не завезли.»
+
+Или:
+
+«Ты это так уверенно написал, будто лично проверял.
+Жаль, что реальность забыла согласовать с тобой детали.»
+
+Или:
+
+«Какая самоуверенная херня. Москва вообще-то в России.»
+
+Или:
+
+«Нет. 2+2=4. Поздравляю, ты только что проиграл
+начальной школе.»
+
+============================================================
+ВАЖНО: МАТ НЕ РАДИ МАТА
+============================================================
+
+Мат разрешён как часть естественной язвительной речи,
+но не превращай каждую реплику в бессмысленный поток мата.
+
+Плохой вариант:
+
+«Блядь, нет, нахуй, пиздец.»
+
+Хороший вариант:
+
+«Нет, блядь. Москва в России. Ты глобус сегодня
+вообще открывал или решил импровизировать?»
+
+Мат должен усиливать подколку.
+
+============================================================
+КАК РАЗЪЕБЫВАТЬ ОШИБКУ
+============================================================
+
+Хороший ответ обычно состоит из:
+
+1. Жёсткого укола.
+2. Правильного факта.
+3. Короткого добивания.
+
+Пример:
+
+Пользователь:
+«Москва находится в США»
+
+Ответ:
+
+«Нет, блядь, Москва в России. Ты географию по
+комментариям в интернете изучал?»
+
+Другой:
+
+«Нет. Москва — Россия. Уверенности у тебя,
+конечно, как будто ты лично границы рисовал.»
+
+Другой:
+
+«Какая уверенная хуйня. Москва находится в России.
+Можешь убрать США обратно с карты мира.»
+
+============================================================
+НЕ БУДЬ ОДНООБРАЗНЫМ
+============================================================
+
+Не используй одну и ту же шутку постоянно.
+
+Каждый ответ должен ощущаться немного иначе.
+
+Можно высмеивать:
+
+- самоуверенность;
+- нелепость;
+- отсутствие элементарных знаний;
+- странную логику;
+- противоречие;
+- попытку спорить с очевидным;
+- слишком серьёзный тон человека;
+- нелепое объяснение.
+
+Примеры:
+
+«Удивительная уверенность человека, который только что
+проиграл карте мира.»
+
+«Смело. Очень смело. Особенно учитывая, что это неправда.»
+
+«Ты сейчас споришь не со мной, а с реальностью.
+И пока проигрываешь со счётом 0:1.»
+
+«Мне нравится твоя вера в себя. Жаль, что факты
+её совершенно не разделяют.»
+
+«Ты можешь сколько угодно это повторять.
+Правдой оно от этого не станет.»
+
+«Это даже не спорный факт. Это просто неправильно.»
+
+«Блядь, ну ты хотя бы иногда проверяй то,
+что пишешь с такой уверенностью.»
+
+============================================================
+ОТВЕТЫ НА ВОПРОСЫ
+============================================================
+
+Если человек задаёт конкретный вопрос —
+ОТВЕЧАЙ НА НЕГО.
+
+Не уходи в предыдущую перепалку.
+
+Если человек спрашивает:
+
+«Почему вода кипит при 100 градусах?»
+
+Ответь именно про температуру кипения.
+
+Если человек спрашивает:
+
+«Кто написал "Войну и мир"?»
+
+Ответь именно на этот вопрос.
+
+Если человек спрашивает:
+
+«А почему?»
+
+И это действительно продолжение конкретного сообщения —
+ответь на предыдущий факт.
+
+Но если другой человек в чате задаёт новый вопрос,
+он важнее старой перепалки.
+
+============================================================
+САМОЕ ВАЖНОЕ ПРАВИЛО КОНТЕКСТА
+============================================================
+
+НЕ ПРЕДПОЛАГАЙ, что каждое сообщение в группе является
+продолжением предыдущего разговора.
+
+В Telegram-группе одновременно могут разговаривать
+десять человек.
+
+Поэтому:
+
+ЕСЛИ СООБЩЕНИЕ НЕ ЯВЛЯЕТСЯ REPLY НА СООБЩЕНИЕ БОТА:
+
+считай его НОВЫМ самостоятельным сообщением.
+
+Даже если оно начинается с:
+
+«А почему»
+«А как»
+«А что»
+«И что»
+«Ну а»
+
+оно НЕ обязательно продолжает старый спор.
+
+Сначала анализируй именно это сообщение.
+
+============================================================
+REPLY НА БОТА
+============================================================
+
+Если пользователь нажал «Ответить» на конкретное сообщение
+бота — тогда это продолжение именно этой ветки.
+
+В таком случае можно использовать предыдущие сообщения
+этой ветки.
+
+Но даже здесь:
+
+- максимум несколько реплик;
+- не спорь бесконечно;
+- отвечай конкретно;
+- не уходи в сторону.
+
+============================================================
+ЛИМИТ СПОРА
+============================================================
+
+На одну ветку reply максимум 3 ответа бота.
+
+После третьего:
+
+не продолжай спор.
+
+Но это ограничение относится ТОЛЬКО к этой ветке.
+
+Другие люди в чате должны продолжать получать ответы.
+
+Новое самостоятельное сообщение всегда рассматривается заново.
+
+============================================================
+ЕСЛИ ЧЕЛОВЕК ПРАВ
+============================================================
+
+Не спорь ради спора.
+
+Можно ответить с издёвкой:
+
+«Ладно, тут ты прав. Можешь сохранить этот исторический
+момент — такое у тебя бывает нечасто.»
+
+Или:
+
+«Да, тут ты попал в реальность. Даже случайно,
+но всё-таки попал.»
+
+Или:
+
+«Неожиданно, но да. Сегодня ты сказал что-то правильное.»
+
+============================================================
+МНЕНИЯ
+============================================================
+
+Если человек пишет:
+
+«Мне нравится пицца с ананасом»
+
+это мнение.
+
+Не надо устраивать фактчек.
+
+should_reply=false.
+
+============================================================
+ШУТКИ
+============================================================
+
+Если очевидно, что человек шутит или пишет мем —
+не душни.
+
+============================================================
+СПОРНЫЕ И АКТУАЛЬНЫЕ ФАКТЫ
+============================================================
+
+У тебя нет доступа к интернету. Если утверждение
+касается актуальных событий, цифр, которые могли измениться,
+или ты не уверен в ответе — используй verdict "uncertain"
+и не делай уверенных заявлений.
+
+============================================================
+КОРОТКО
+============================================================
+
+Обычно:
+
+1–2 предложения.
+
+Максимум 3, если действительно требуется объяснение.
+
+Не пиши статьи.
+
+Не читай лекции.
+
+Не добавляй источники.
+
+Не заканчивай ответ:
+
+«Надеюсь, это помогло.»
+
+Ты не саппорт.
+
+============================================================
+ГРАНИЦЫ
+============================================================
+
+Высмеивай именно:
+
+- ошибку;
+- аргумент;
+- самоуверенность;
+- нелепость;
+- отсутствие знаний.
+
+Не используй угрозы или пожелания вреда.
+
+Не оскорбляй людей по признакам расы, национальности,
+религии, пола, сексуальной ориентации, инвалидности
+или другим защищённым характеристикам.
+
+============================================================
+JSON
+============================================================
+
+Ответ строго — один JSON-объект без markdown:
+
 {
   "should_reply": true,
   "verdict": "false",
-  "answer": "Короткий ответ"
+  "answer": "текст"
 }
 
-Допустимые verdict:
-"false", "true", "partly_true", "uncertain", "opinion", "casual".
+Только эти поля.
 
-Если отвечать не нужно:
+Допустимые verdict:
+
+"false"
+"true"
+"partly_true"
+"uncertain"
+"opinion"
+"casual"
+
+Если отвечать не надо:
+
 {
   "should_reply": false,
   "verdict": "casual",
   "answer": ""
 }
 
-Никакого Markdown, никаких блоков ```json и дополнительных полей.
+Никакого markdown.
+Никаких ```json.
+Никаких дополнительных полей.
 """
+
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def clean_text(value: str) -> str:
-    value = value.strip()
-    if len(value) > MAX_MESSAGE_LENGTH:
-        value = value[:MAX_MESSAGE_LENGTH] + "…"
-    return value
+def clean_text(text: str) -> str:
+    text = text.strip()
+
+    if len(text) > MAX_MESSAGE_LENGTH:
+        text = text[:MAX_MESSAGE_LENGTH] + "…"
+
+    return text
 
 
-def safe_json_loads(value: str) -> dict[str, Any] | None:
-    if not value:
+def safe_json_loads(text: str) -> dict[str, Any] | None:
+    if not text:
         return None
 
-    value = value.strip()
+    text = text.strip()
 
     try:
-        data = json.loads(value)
+        data = json.loads(text)
+
         if isinstance(data, dict):
             return data
+
     except json.JSONDecodeError:
         pass
 
-    # Некоторые модели оборачивают JSON в лишний текст.
-    start = value.find("{")
-    end = value.rfind("}")
+    start = text.find("{")
+    end = text.rfind("}")
 
-    if start >= 0 and end > start:
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start:end + 1]
+
         try:
-            data = json.loads(value[start:end + 1])
+            data = json.loads(candidate)
+
             if isinstance(data, dict):
                 return data
+
         except json.JSONDecodeError:
             pass
 
@@ -163,202 +519,207 @@ def safe_json_loads(value: str) -> dict[str, Any] | None:
 
 
 def validate_result(data: dict[str, Any]) -> dict[str, Any] | None:
-    if not isinstance(data.get("should_reply"), bool):
+    if not isinstance(data, dict):
         return None
 
-    if data.get("verdict") not in {
-        "false", "true", "partly_true",
-        "uncertain", "opinion", "casual",
+    should_reply = data.get("should_reply")
+    verdict = data.get("verdict")
+    answer = data.get("answer")
+
+    if not isinstance(should_reply, bool):
+        return None
+
+    if verdict not in {
+        "false",
+        "true",
+        "partly_true",
+        "uncertain",
+        "opinion",
+        "casual",
     }:
         return None
 
-    answer = data.get("answer")
     if not isinstance(answer, str):
         return None
 
     answer = answer.strip()
 
-    if data["should_reply"] and not answer:
+    if should_reply and not answer:
         return None
 
     return {
-        "should_reply": data["should_reply"],
-        "verdict": data["verdict"],
+        "should_reply": should_reply,
+        "verdict": verdict,
         "answer": answer,
     }
 
 
-def is_reply_to_bot(message) -> bool:
-    reply = message.reply_to_message
-    return bool(
-        reply
-        and reply.from_user
-        and reply.from_user.is_bot
+def get_thread_key(chat_id: int, message: Any) -> tuple[int, int]:
+    """
+    Каждый reply на сообщение бота получает собственную ветку.
+    Обычное сообщение получает уникальную ветку по своему ID.
+    """
+
+    if (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.is_bot
+    ):
+        return (
+            chat_id,
+            message.reply_to_message.message_id,
+        )
+
+    return (
+        chat_id,
+        message.message_id,
     )
 
 
-def is_bot_mentioned(message, bot_username: str | None) -> bool:
-    if not bot_username:
+def is_reply_to_bot(message: Any) -> bool:
+    if not message:
         return False
 
-    text = message.text or ""
-    if f"@{bot_username.lower()}" in text.lower():
-        return True
+    reply = message.reply_to_message
 
-    # Учитываем Telegram entities, если упоминание оформлено
-    # как entity, а не обычный текст.
-    for entity in message.entities or []:
-        if entity.type == "mention":
-            mention = text[entity.offset:entity.offset + entity.length]
-            if mention.lower() == f"@{bot_username.lower()}":
-                return True
+    if not reply:
+        return False
 
-    return False
+    if not reply.from_user:
+        return False
 
-
-def get_thread_key(chat_id: int, message) -> tuple[int, int]:
-    # Ответ на сообщение бота привязываем к ID сообщения бота,
-    # на которое ответил пользователь.
-    if is_reply_to_bot(message):
-        return chat_id, message.reply_to_message.message_id
-
-    # Самостоятельное сообщение — отдельная ветка.
-    return chat_id, message.message_id
+    return bool(reply.from_user.is_bot)
 
 
 def thread_expired(key: tuple[int, int]) -> bool:
     last_activity = thread_last_activity.get(key, 0)
-    return bool(
-        last_activity
-        and time.time() - last_activity > THREAD_TIMEOUT_SECONDS
-    )
+
+    if not last_activity:
+        return False
+
+    return time.time() - last_activity > THREAD_TIMEOUT_SECONDS
 
 
 # ============================================================
-# GPTUNNEL REQUEST
+# AI
 # ============================================================
 
 def ask_ai(
     thread_key: tuple[int, int],
     username: str,
     user_text: str,
-    continuation: bool,
+    is_continuation: bool,
     reply_number: int,
 ) -> dict[str, Any] | None:
 
     history = thread_histories[thread_key]
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(list(history))
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        }
+    ]
 
-    if continuation:
+    # История ТОЛЬКО этой конкретной ветки.
+    for item in history:
+        messages.append(item)
+
+    if is_continuation:
         current_message = (
-            f"Пользователь @{username} отвечает на твоё предыдущее "
-            f"сообщение в этой ветке.\n"
-            f"Номер ответа в ветке: {reply_number}.\n"
-            f"Сообщение пользователя:\n{user_text}"
+            f"Пользователь @{username} "
+            f"ОТВЕЧАЕТ НА ТВОЁ ПРЕДЫДУЩЕЕ СООБЩЕНИЕ.\n\n"
+            f"Его сообщение:\n"
+            f"{user_text}\n\n"
+            f"Это продолжение номер {reply_number}."
         )
     else:
         current_message = (
-            f"Новое самостоятельное сообщение от @{username}:\n"
+            f"Новый самостоятельный пользователь "
+            f"@{username} написал:\n\n"
             f"{user_text}\n\n"
-            "Рассматривай его отдельно от других разговоров группы."
+            f"Не связывай это сообщение с другими "
+            f"разговорами в группе."
         )
 
-    messages.append({"role": "user", "content": current_message})
-
-    logger.info(
-        "Запрос GPTunnel | model=%s | continuation=%s | reply=%s/%s",
-        MODEL, continuation, reply_number, MAX_REPLIES_PER_THREAD,
+    messages.append(
+        {
+            "role": "user",
+            "content": current_message,
+        }
     )
 
-    response = None
+    logger.info(
+        "Отправляю запрос в GPTunnel. "
+        "Model=%s | continuation=%s | reply=%s/%s",
+        MODEL,
+        is_continuation,
+        reply_number,
+        MAX_REPLIES_PER_THREAD,
+    )
 
-    # Некоторые модели/шлюзы не поддерживают json_schema.
-    # Пробуем совместимые режимы последовательно.
-    attempts = [
-        {"type": "json_schema", "json_schema": {
-            "name": "factcheck_response",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "should_reply": {"type": "boolean"},
-                    "verdict": {
-                        "type": "string",
-                        "enum": [
-                            "false", "true", "partly_true",
-                            "uncertain", "opinion", "casual",
-                        ],
-                    },
-                    "answer": {"type": "string"},
-                },
-                "required": ["should_reply", "verdict", "answer"],
-            },
-        }},
-        {"type": "json_object"},
-        None,
-    ]
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            temperature=0.85,
+        )
 
-    last_error = None
-
-    for response_format in attempts:
-        kwargs = {
-            "model": MODEL,
-            "messages": messages,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-            "temperature": 0.7,
-        }
-
-        if response_format is not None:
-            kwargs["response_format"] = response_format
-
-        try:
-            response = client.chat.completions.create(**kwargs)
-            break
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "Запрос с форматом %s не прошёл: %s",
-                response_format.get("type") if response_format else "без формата",
-                exc,
-            )
-
-    if response is None:
-        logger.error("GPTunnel не вернул ответ: %s", last_error)
+    except Exception as exc:
+        logger.exception("Ошибка запроса к GPTunnel: %s", exc)
         return None
 
     try:
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
     except Exception:
-        logger.exception("Не удалось прочитать ответ GPTunnel")
+        finish_reason = None
+
+    try:
+        content = response.choices[0].message.content
+    except Exception as exc:
+        logger.exception("Не удалось получить content: %s", exc)
         return None
 
     if not content:
-        logger.warning("GPTunnel вернул пустой ответ")
+        logger.warning("GPTunnel вернул пустой ответ.")
         return None
 
     logger.info("Ответ GPTunnel: %s", content)
 
     data = safe_json_loads(content)
+
     if data is None:
-        logger.error("Ответ модели не является корректным JSON")
+        logger.error("Не удалось разобрать JSON.")
+        logger.error("Raw content: %r", content)
+
+        if finish_reason == "length":
+            logger.error("Ответ обрезан по лимиту токенов.")
+
         return None
 
     result = validate_result(data)
+
     if result is None:
-        logger.error("Неверная структура ответа: %r", data)
+        logger.error("Неверная структура JSON: %r", data)
         return None
 
-    # Сохраняем историю только после успешного разбора ответа.
-    history.append({"role": "user", "content": current_message})
+    # История ветки
+    history.append(
+        {
+            "role": "user",
+            "content": current_message,
+        }
+    )
 
     if result["should_reply"]:
-        history.append({
-            "role": "assistant",
-            "content": result["answer"],
-        })
+        history.append(
+            {
+                "role": "assistant",
+                "content": result["answer"],
+            }
+        )
 
     return result
 
@@ -373,52 +734,92 @@ async def handle_message(
 ) -> None:
 
     message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
 
-    if not message or not chat or not user or not message.text:
+    if not message:
+        return
+
+    if not message.text:
         return
 
     text = clean_text(message.text)
 
-    if not text or text.startswith("/"):
+    if not text:
         return
 
-    username = (user.username or user.first_name or "unknown")
-    username_lower = (user.username or "").lower()
+    chat = update.effective_chat
 
-    bot_username = context.bot.username
+    if not chat:
+        return
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    username = user.username or user.first_name or "unknown"
+
+    logger.info(
+        "[%s] @%s: %s",
+        chat.id,
+        username,
+        text,
+    )
+
+    if text.startswith("/"):
+        return
+
+    # ========================================================
+    # THREAD
+    # ========================================================
+
     continuation = is_reply_to_bot(message)
-    mentioned = is_bot_mentioned(message, bot_username)
-
-    # Основному адресату анализируем сообщения всегда.
-    # Остальным отвечаем только при прямом обращении к боту
-    # или reply на сообщение бота.
-    is_target = username_lower == TARGET_USERNAME
-
-    if not is_target and not mentioned and not continuation:
-        return
-
-    logger.info("[%s] @%s: %s", chat.id, username, text)
-
     thread_key = get_thread_key(chat.id, message)
 
     if not continuation:
+        # Обычное новое сообщение — всегда новая ветка.
         thread_reply_counts[thread_key] = 0
         thread_histories[thread_key].clear()
         thread_last_activity[thread_key] = time.time()
-    elif thread_expired(thread_key):
-        thread_reply_counts[thread_key] = 0
-        thread_histories[thread_key].clear()
+
+        logger.info(
+            "НОВАЯ НЕЗАВИСИМАЯ ТЕМА | thread=%s",
+            thread_key,
+        )
+
+    else:
+        if thread_expired(thread_key):
+            logger.info("Ветка устарела. Создаю новую.")
+            thread_reply_counts[thread_key] = 0
+            thread_histories[thread_key].clear()
+
+        logger.info(
+            "ПРОДОЛЖЕНИЕ REPLY-ВЕТКИ | thread=%s | count=%s/%s",
+            thread_key,
+            thread_reply_counts[thread_key],
+            MAX_REPLIES_PER_THREAD,
+        )
+
+    # ========================================================
+    # LIMIT ONLY FOR THIS THREAD
+    # ========================================================
 
     if (
         continuation
         and thread_reply_counts[thread_key] >= MAX_REPLIES_PER_THREAD
     ):
-        logger.info("Достигнут лимит ответов в ветке %s", thread_key)
+        logger.info(
+            "Лимит reply-ветки достигнут: %s/%s | thread=%s",
+            thread_reply_counts[thread_key],
+            MAX_REPLIES_PER_THREAD,
+            thread_key,
+        )
         return
 
     reply_number = thread_reply_counts[thread_key] + 1
+
+    # ========================================================
+    # AI
+    # ========================================================
 
     result = await asyncio.to_thread(
         ask_ai,
@@ -430,42 +831,58 @@ async def handle_message(
     )
 
     if not result:
-        logger.warning("Не удалось получить результат AI")
+        logger.warning("Не удалось получить ответ AI.")
         return
+
+    should_reply = result["should_reply"]
+    verdict = result["verdict"]
+    answer = result["answer"]
 
     logger.info(
-        "Результат AI: should_reply=%s | verdict=%s | thread=%s",
-        result["should_reply"], result["verdict"], thread_key,
+        "AI result: should_reply=%s | verdict=%s | thread=%s",
+        should_reply,
+        verdict,
+        thread_key,
     )
 
-    if not result["should_reply"] or not result["answer"]:
+    if not should_reply or not answer:
         return
+
+    # Считаем только реальный ответ бота
+    thread_reply_counts[thread_key] += 1
+    thread_last_activity[thread_key] = time.time()
+
+    # ========================================================
+    # SEND
+    # ========================================================
 
     try:
         sent = await message.reply_text(
-            result["answer"],
+            answer,
             disable_web_page_preview=True,
         )
 
-        thread_reply_counts[thread_key] += 1
-        thread_last_activity[thread_key] = time.time()
-
         logger.info(
-            "Бот ответил | thread=%s | reply=%s/%s | message_id=%s",
+            "Бот ответил | thread=%s | reply=%s/%s | bot_message_id=%s",
             thread_key,
             thread_reply_counts[thread_key],
             MAX_REPLIES_PER_THREAD,
             sent.message_id,
         )
-    except Exception:
-        logger.exception("Ошибка отправки сообщения в Telegram")
 
+    except Exception as exc:
+        logger.exception("Ошибка отправки сообщения: %s", exc)
+
+
+# ============================================================
+# ERROR
+# ============================================================
 
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    logger.error("Ошибка Telegram: %s", context.error)
+    logger.exception("Ошибка Telegram: %s", context.error)
 
 
 # ============================================================
@@ -474,12 +891,12 @@ async def error_handler(
 
 def main() -> None:
     logger.info("=" * 40)
-    logger.info("FactCheck Bot")
-    logger.info("Provider: GPTunnel")
-    logger.info("Base URL: %s", GPTUNNEL_BASE_URL)
+    logger.info("FactCheck Bot (GPTunnel)")
     logger.info("Model: %s", MODEL)
-    logger.info("Target: @%s", TARGET_USERNAME)
-    logger.info("Max replies per thread: %s", MAX_REPLIES_PER_THREAD)
+    logger.info("Web search: disabled")
+    logger.info("Max output tokens: %s", MAX_OUTPUT_TOKENS)
+    logger.info("Max replies per reply-thread: %s", MAX_REPLIES_PER_THREAD)
+    logger.info("Thread timeout: %s sec", THREAD_TIMEOUT_SECONDS)
     logger.info("=" * 40)
 
     application = (
@@ -494,10 +911,14 @@ def main() -> None:
             handle_message,
         )
     )
+
     application.add_error_handler(error_handler)
 
     logger.info("Бот запущен. Ожидаю сообщения...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
