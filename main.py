@@ -11,6 +11,7 @@ from openai import OpenAI
 from telegram import Update
 from telegram.ext import (
     Application,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -33,8 +34,9 @@ if not GPTUNNEL_API_KEY:
     raise RuntimeError("Не найден GPTUNNEL_API_KEY в переменных окружения")
 
 
-# Точное название модели берите из личного кабинета GPTunnel.
-MODEL = "gemini-2.5-flash"
+# Модель берётся из переменной MODEL на bothost.
+# Если переменная не задана, используется значение по умолчанию.
+MODEL = os.getenv("MODEL", "gemini-2.5-flash").strip()
 GPTUNNEL_BASE_URL = "https://gptunnel.ru/v1"
 
 MAX_HISTORY = 8
@@ -725,8 +727,25 @@ def ask_ai(
 
 
 # ============================================================
-# TELEGRAM HANDLER
+# TELEGRAM HANDLERS
 # ============================================================
+
+async def model_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Команда /model — показывает, какая модель сейчас используется.
+    """
+    message = update.effective_message
+
+    if not message:
+        return
+
+    await message.reply_text(
+        f"Сейчас использую модель: {MODEL}"
+    )
+
 
 async def handle_message(
     update: Update,
@@ -892,7 +911,7 @@ async def error_handler(
 def main() -> None:
     logger.info("=" * 40)
     logger.info("FactCheck Bot (GPTunnel)")
-    logger.info("Model: %s", MODEL)
+    logger.info("Model из переменной MODEL: %s", MODEL)
     logger.info("Web search: disabled")
     logger.info("Max output tokens: %s", MAX_OUTPUT_TOKENS)
     logger.info("Max replies per reply-thread: %s", MAX_REPLIES_PER_THREAD)
@@ -903,6 +922,10 @@ def main() -> None:
         Application.builder()
         .token(BOT_TOKEN)
         .build()
+    )
+
+    application.add_handler(
+        CommandHandler("model", model_command)
     )
 
     application.add_handler(
