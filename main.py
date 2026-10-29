@@ -38,6 +38,9 @@ if not GPTUNNEL_API_KEY:
 MODEL = os.getenv("MODEL", "gemini-2.5-flash").strip()
 GPTUNNEL_BASE_URL = "https://gptunnel.ru/v1"
 
+# Бот отвечает только этому пользователю (без @, в нижнем регистре).
+ALLOWED_USERNAME = "dimkasiter"
+
 MAX_HISTORY = 8
 MAX_MESSAGE_LENGTH = 2000
 
@@ -491,11 +494,21 @@ def clean_text(text: str) -> str:
     return text
 
 
+def is_allowed_user(user: Any) -> bool:
+    """
+    Проверяет, что пишет именно разрешённый пользователь.
+    Сравнение без учёта регистра и без символа @.
+    """
+    if not user or not user.username:
+        return False
+
+    return user.username.lower() == ALLOWED_USERNAME.lower()
+
+
 def safe_json_loads(text: str) -> dict[str, Any] | None:
     """
     strict=False разрешает переносы строк и другие управляющие
     символы внутри строковых значений JSON.
-    Модели иногда вставляют их в поле answer.
     """
     if not text:
         return None
@@ -553,8 +566,7 @@ def validate_result(data: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(answer, str):
         return None
 
-    # Убираем переносы строк, чтобы сообщение в Telegram
-    # не выглядело разорванным.
+    # Убираем переносы строк, чтобы сообщение в Telegram не разрывалось.
     answer = " ".join(answer.split())
 
     if should_reply and not answer:
@@ -747,10 +759,15 @@ async def model_command(
 ) -> None:
     """
     Команда /model — показывает, какая модель сейчас используется.
+    Работает только для разрешённого пользователя.
     """
     message = update.effective_message
+    user = update.effective_user
 
     if not message:
+        return
+
+    if not is_allowed_user(user):
         return
 
     await message.reply_text(
@@ -771,6 +788,12 @@ async def handle_message(
     if not message.text:
         return
 
+    user = update.effective_user
+
+    # Отвечаем только одному пользователю, остальных игнорируем.
+    if not is_allowed_user(user):
+        return
+
     text = clean_text(message.text)
 
     if not text:
@@ -781,12 +804,7 @@ async def handle_message(
     if not chat:
         return
 
-    user = update.effective_user
-
-    if not user:
-        return
-
-    username = user.username or user.first_name or "unknown"
+    username = user.username
 
     logger.info(
         "[%s] @%s: %s",
@@ -923,6 +941,7 @@ def main() -> None:
     logger.info("=" * 40)
     logger.info("FactCheck Bot (GPTunnel)")
     logger.info("Model из переменной MODEL: %s", MODEL)
+    logger.info("Отвечает только: @%s", ALLOWED_USERNAME)
     logger.info("Web search: disabled")
     logger.info("Max output tokens: %s", MAX_OUTPUT_TOKENS)
     logger.info("Max replies per reply-thread: %s", MAX_REPLIES_PER_THREAD)
